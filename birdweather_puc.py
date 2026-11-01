@@ -29,7 +29,7 @@ from zoneinfo import ZoneInfo
 import requests
 
 URL = "https://app.birdweather.com/graphql"
-PAGE_SIZE = 500
+PAGE_SIZE = 2000
 PAUSE = 0.2  
 
 NE = {"lat": 55.1, "lon": 15.1}
@@ -44,21 +44,34 @@ def get_session():
         _local.session = requests.Session()
     return _local.session
 
-def gql(query, variables, retries=4, allow_partial=False):
-    last = None
+def gql(query, variables, retries=8, allow_partial=False):
+    base_pause = 2.0
     for attempt in range(retries):
         try:
             r = get_session().post(URL, json={"query": query, "variables": variables}, timeout=90)
+            
+            if r.status_code == 429:
+                retry_after = r.headers.get("Retry-After")
+                if retry_after and retry_after.isdigit():
+                    wait_time = int(retry_after)
+                else:
+                    wait_time = base_pause * (2 ** attempt)
+                
+                print(f"    [Rate-Limit] Warte {wait_time}s laut Server...")
+                time.sleep(wait_time)
+                continue
+
             r.raise_for_status()
             body = r.json()
         except (requests.RequestException, ValueError) as e:
-            last = e
-            time.sleep(2 ** attempt)
+            time.sleep(base_pause * (2 ** attempt))
             continue
+
         if body.get("errors") and not (allow_partial and body.get("data")):
             raise RuntimeError(body["errors"])
         return body["data"]
-    raise last
+    
+    raise RuntimeError("API dauerhaft blockiert. Später erneut versuchen.")
 
 def paginate(query, variables, get_connection, allow_partial=False):
     after = None
@@ -109,7 +122,6 @@ query($ids: [ID!], $period: InputDuration, $first: Int, $after: String) {
   }
 }
 """
-
 SENSOR_FIELDS = {
     "environment": ["temperature", "humidity", "barometricPressure", "voc",
                     "eco2", "aqi", "soundPressureLevel"],
