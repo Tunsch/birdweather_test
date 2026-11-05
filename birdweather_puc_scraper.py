@@ -101,6 +101,15 @@ query($first: Int, $after: String, $ne: InputLocation, $sw: InputLocation) {
   }
 }
 """
+STATION_BY_ID_Q = """
+query($id: ID!) {
+  station(id: $id) {
+    id name type country state location locationPrivacy timezone
+    earliestDetectionAt latestDetectionAt
+    coords { lat lon }
+  }
+}
+"""
 
 TIMEZONES_Q = """
 query($first: Int, $after: String, $ne: InputLocation, $sw: InputLocation) {
@@ -337,12 +346,8 @@ def main():
                     help="Vorhandene Teildateien dieses Zeitraums löschen und komplett neu abrufen")
     args = ap.parse_args()
 
-    # Weltmodus forcieren, falls IDs abgefragt werden, die ggf. nicht in D liegen
     if args.world or args.stations:
         DEFAULT_TZ = "UTC"
-        variables = {}
-    else:
-        variables = {"ne": NE, "sw": SW}
         
     start_date = date.fromisoformat(args.start_date)
     end_date = date.fromisoformat(args.end_date) if args.end_date else start_date
@@ -358,33 +363,54 @@ def main():
         shutil.rmtree(parts)
     parts.mkdir(parents=True, exist_ok=True)
 
-    print(f"Lade Stationen ({'weltweit' if args.world or args.stations else 'Deutschland'}) ...")
-    raw = list(paginate(STATIONS_Q, variables, lambda d: d["stations"], allow_partial=True))
-    stations = [s for s in raw if s]
-    print(f"  {len(stations)} Stationen geladen")
-
-    pucs = [s for s in stations if s["type"] == "puc"]
-    
-    # Filtern nach spezifischen Stationen ODER nach Ländern
+    # 1) PUC-Stationen laden
+    pucs = []
     if args.stations:
-        pucs = [s for s in pucs if s["id"] in args.stations]
-        print(f"  Filter auf {len(args.stations)} spezifische IDs angewendet.")
-    elif not args.world and not args.no_country_filter:
-        pucs = [s for s in pucs if (s.get("country") or "").lower() in GERMANY_NAMES]
+        print(f"Lade {len(args.stations)} spezifische Station(en) direkt über ihre ID...")
+        for sid in args.stations:
+            try:
+                data = gql(STATION_BY_ID_Q, {"id": sid})
+                st = data.get("station") if data else None
+                if st:
+                    pucs.append(st)
+                else:
+                    print(f"  Warnung: Station {sid} nicht gefunden.")
+            except Exception as e:
+                print(f"  Fehler beim Abruf von Station {sid}: {e}")
+    else:
+        print(f"Lade Stationen ({'weltweit' if args.world else 'Deutschland'}) ...")
+        variables = {} if args.world else {"ne": NE, "sw": SW}
+        raw = list(paginate(STATIONS_Q, variables, lambda d: d["stations"], allow_partial=True))
+        stations = [s for s in raw if s]
+        print(f"  {len(stations)} Stationen geladen")
 
-    print(f"  {len(pucs)} PUC-Stationen nach Filter")
+        pucs = [s for s in stations if s["type"] == "puc"]
+        countries = Counter(s.get("country") for s in pucs)
+        print("  Länder der PUCs:", dict(countries.most_common(15)),
+              "..." if len(countries) > 15 else "")
+        
+        if not args.world and not args.no_country_filter:
+            pucs = [s for s in pucs if (s.get("country") or "").lower() in GERMANY_NAMES]
+
+        print(f"  {len(pucs)} PUC-Stationen nach Filter")
+
+        if pucs:
+            print("Lade Zeitzonen ...")
+            tzmap = {s["id"]: s["timezone"]
+                     for s in paginate(TIMEZONES_Q, variables, lambda d: d["stations"], allow_partial=True)
+                     if s and s.get("timezone")}
+            for s in pucs:
+                if s["id"] in tzmap:
+                    s["timezone"] = tzmap[s["id"]]
+
     if not pucs:
-        sys.exit("Keine PUC-Stationen gefunden (Filterkriterien prüfen).")
+        sys.exit("Keine gültigen PUC-Stationen gefunden.")
 
-    print("Lade Zeitzonen ...")
-    tzmap = {s["id"]: s["timezone"]
-             for s in paginate(TIMEZONES_Q, variables, lambda d: d["stations"], allow_partial=True)
-             if s and s.get("timezone")}
+    # Zeitzonen-Quelle und Fallback ermitteln
     src = Counter()
     for s in pucs:
-        name = tzmap.get(s["id"])
-        if name:
-            s["timezone"], s["timezone_source"] = name, "api"
+        if s.get("timezone"):
+            s["timezone_source"] = "api"
         else:
             c = s.get("coords") or {}
             name = tz_from_coords(c.get("lat"), c.get("lon"))
@@ -394,6 +420,11 @@ def main():
                 s["timezone"], s["timezone_source"] = None, "default"
         src[s["timezone_source"]] += 1
     
+    print(f"  {len(pucs)} Station(en) bereit zur Abfrage.")
+    print(f"  Zeitzone: {src.get('api', 0)} aus der API, {src.get('coords', 0)} aus Koordinaten, "
+          f"{src.get('default', 0)} nicht ermittelbar (es wird {DEFAULT_TZ} angenommen)")
+
+    # 2) Optional: inaktive Stationen aussortieren
     to_query, station_rows = [], []
     for s in pucs:
         if args.only_active and not is_active_in_range(s, station_tz(s), start_date, end_date):
@@ -407,6 +438,7 @@ def main():
 
     write_csv_atomic(out / "stations.csv", STATION_COLS, station_rows)
 
+    # 3) Pro Station: Detections + Sensordaten
     ctx = {"args": args, "start_date": start_date, "end_date": end_date, "parts": parts, "stop": threading.Event(),
            "lock": threading.Lock(), "done": 0, "total": len(to_query), "t0": time.time()}
     interrupted = False
@@ -436,6 +468,7 @@ def main():
             already_done += r["skipped"]
             failed += r["failed"]
 
+    # 4) Fertige CSV-Dateien zusammensetzen
     ids = [s["id"] for s in to_query]
     totals = {}
     if not args.no_detections:
@@ -453,6 +486,6 @@ def main():
     print(f"Dateien in: {out.resolve()}")
     if interrupted:
         sys.exit(130)
-
+        
 if __name__ == "__main__":
     main()
