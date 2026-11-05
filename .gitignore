@@ -1,3 +1,5 @@
 birdweather_check/
 birdweather_out/
 __pycache__/
+qgis/
+birdweather_check_server/

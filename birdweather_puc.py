@@ -30,7 +30,7 @@ import requests
 
 URL = "https://app.birdweather.com/graphql"
 PAGE_SIZE = 2000
-PAUSE = 0.2  
+PAUSE = 0.1  
 
 NE = {"lat": 55.1, "lon": 15.1}
 SW = {"lat": 47.2, "lon": 5.8}
@@ -45,11 +45,13 @@ def get_session():
     return _local.session
 
 def gql(query, variables, retries=8, allow_partial=False):
+    """POST an die API mit dynamischem Backoff bei Rate-Limits (HTTP 429)."""
     base_pause = 2.0
     for attempt in range(retries):
         try:
             r = get_session().post(URL, json={"query": query, "variables": variables}, timeout=90)
             
+            # Rate-Limit abfangen
             if r.status_code == 429:
                 retry_after = r.headers.get("Retry-After")
                 if retry_after and retry_after.isdigit():
@@ -57,7 +59,7 @@ def gql(query, variables, retries=8, allow_partial=False):
                 else:
                     wait_time = base_pause * (2 ** attempt)
                 
-                print(f"    [Rate-Limit] Warte {wait_time}s laut Server...")
+                print(f"    [Rate-Limit 429] Warte {wait_time}s...")
                 time.sleep(wait_time)
                 continue
 
@@ -122,6 +124,7 @@ query($ids: [ID!], $period: InputDuration, $first: Int, $after: String) {
   }
 }
 """
+
 SENSOR_FIELDS = {
     "environment": ["temperature", "humidity", "barometricPressure", "voc",
                     "eco2", "aqi", "soundPressureLevel"],
@@ -319,6 +322,7 @@ def main():
     ap.add_argument("--end-date", default=None, help="Enddatum (YYYY-MM-DD), Stationszeit. Optional.")
     ap.add_argument("--out", default="birdweather_out", help="Ausgabeordner")
     ap.add_argument("--world", action="store_true", help="Alle PUC-Stationen weltweit statt nur Deutschland")
+    ap.add_argument("--stations", nargs="+", help="Spezifische Stations-IDs abrufen (z.B. --stations 123 456).")
     ap.add_argument("--sensors", nargs="+", default=list(SENSOR_FIELDS),
                     choices=list(SENSOR_FIELDS), help="Welche Sensortypen abgerufen werden")
     ap.add_argument("--no-country-filter", action="store_true",
@@ -333,8 +337,12 @@ def main():
                     help="Vorhandene Teildateien dieses Zeitraums löschen und komplett neu abrufen")
     args = ap.parse_args()
 
-    if args.world:
+    # Weltmodus forcieren, falls IDs abgefragt werden, die ggf. nicht in D liegen
+    if args.world or args.stations:
         DEFAULT_TZ = "UTC"
+        variables = {}
+    else:
+        variables = {"ne": NE, "sw": SW}
         
     start_date = date.fromisoformat(args.start_date)
     end_date = date.fromisoformat(args.end_date) if args.end_date else start_date
@@ -350,23 +358,23 @@ def main():
         shutil.rmtree(parts)
     parts.mkdir(parents=True, exist_ok=True)
 
-    print(f"Lade Stationen ({'weltweit' if args.world else 'Deutschland'}) ...")
-    variables = {} if args.world else {"ne": NE, "sw": SW}
+    print(f"Lade Stationen ({'weltweit' if args.world or args.stations else 'Deutschland'}) ...")
     raw = list(paginate(STATIONS_Q, variables, lambda d: d["stations"], allow_partial=True))
     stations = [s for s in raw if s]
-    print(f"  {len(stations)} Stationen geladen"
-          + (f" ({len(raw) - len(stations)} Einträge nicht lesbar)" if len(raw) != len(stations) else ""))
-    print("  Typen:", dict(Counter(s["type"] for s in stations)))
+    print(f"  {len(stations)} Stationen geladen")
 
     pucs = [s for s in stations if s["type"] == "puc"]
-    countries = Counter(s.get("country") for s in pucs)
-    print("  Länder der PUCs:", dict(countries.most_common(15)),
-          "..." if len(countries) > 15 else "")
-    if not args.world and not args.no_country_filter:
+    
+    # Filtern nach spezifischen Stationen ODER nach Ländern
+    if args.stations:
+        pucs = [s for s in pucs if s["id"] in args.stations]
+        print(f"  Filter auf {len(args.stations)} spezifische IDs angewendet.")
+    elif not args.world and not args.no_country_filter:
         pucs = [s for s in pucs if (s.get("country") or "").lower() in GERMANY_NAMES]
+
     print(f"  {len(pucs)} PUC-Stationen nach Filter")
     if not pucs:
-        sys.exit("Keine PUC-Stationen gefunden (Länderwerte oben prüfen, ggf. --no-country-filter).")
+        sys.exit("Keine PUC-Stationen gefunden (Filterkriterien prüfen).")
 
     print("Lade Zeitzonen ...")
     tzmap = {s["id"]: s["timezone"]
@@ -385,11 +393,7 @@ def main():
             else:
                 s["timezone"], s["timezone_source"] = None, "default"
         src[s["timezone_source"]] += 1
-    print(f"  Zeitzone: {src['api']} aus der API, {src['coords']} aus Koordinaten, "
-          f"{src['default']} nicht ermittelbar (es wird {DEFAULT_TZ} angenommen)")
-    if src["default"] and not src["coords"]:
-        print("  Tipp: pip install timezonefinder ermittelt fehlende Zeitzonen aus den Koordinaten")
-
+    
     to_query, station_rows = [], []
     for s in pucs:
         if args.only_active and not is_active_in_range(s, station_tz(s), start_date, end_date):
@@ -443,8 +447,7 @@ def main():
     print(f"Teile neu abgerufen: {newly_fetched}, bereits vorhanden: {already_done}")
     print("Zeilen insgesamt:", totals)
     if failed:
-        print(f"{len(failed)} Teile fehlgeschlagen ({', '.join(failed[:10])}"
-              f"{' ...' if len(failed) > 10 else ''}). Skript erneut starten, um sie nachzuholen.")
+        print(f"{len(failed)} Teile fehlgeschlagen. Skript erneut starten, um sie nachzuholen.")
     if interrupted:
         print("Zum Fortsetzen denselben Befehl noch einmal ausführen.")
     print(f"Dateien in: {out.resolve()}")
