@@ -3,14 +3,10 @@
 Ruft von BirdWeather-PUC-Stationen Daten für Zeiträume oder Einzeltage ab:
   - Standort (stations.csv)
   - Detections (detections.csv)
-  - Sensordaten (sensor_<typ>.csv)
+  - Sensordaten inkl. AirPollution (sensor_<typ>.csv)
 
 Standard: PUC-Stationen in Deutschland. Mit --world: alle PUC-Stationen weltweit.
-
-Resume: Jeder Abruf (pro Station und Datentyp) wird als eigene Teildatei in
-<out>/<zeitraum>/parts/ gespeichert. Beim nächsten Start werden vorhandene Teile
-übersprungen. Die fertigen CSV-Dateien werden am Ende immer aus den Teilen der
-aktuell abgefragten Stationen neu zusammengesetzt.
+Mit --stations ID1 ID2: nur spezifische Stationen abrufen (überspringt Netzwerksuche).
 """
 import argparse
 import csv
@@ -51,7 +47,6 @@ def gql(query, variables, retries=8, allow_partial=False):
         try:
             r = get_session().post(URL, json={"query": query, "variables": variables}, timeout=90)
             
-            # Rate-Limit abfangen
             if r.status_code == 429:
                 retry_after = r.headers.get("Retry-After")
                 if retry_after and retry_after.isdigit():
@@ -101,6 +96,7 @@ query($first: Int, $after: String, $ne: InputLocation, $sw: InputLocation) {
   }
 }
 """
+
 STATION_BY_ID_Q = """
 query($id: ID!) {
   station(id: $id) {
@@ -137,6 +133,7 @@ query($ids: [ID!], $period: InputDuration, $first: Int, $after: String) {
 SENSOR_FIELDS = {
     "environment": ["temperature", "humidity", "barometricPressure", "voc",
                     "eco2", "aqi", "soundPressureLevel"],
+    "airPollution": ["aqi", "co", "no", "no2", "o3", "so2", "pm2_5", "pm10", "nh3"],
     "light": ["clear", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "nir"],
     "mag": ["x", "y", "z"],
     "accel": ["x", "y", "z"],
@@ -421,8 +418,6 @@ def main():
         src[s["timezone_source"]] += 1
     
     print(f"  {len(pucs)} Station(en) bereit zur Abfrage.")
-    print(f"  Zeitzone: {src.get('api', 0)} aus der API, {src.get('coords', 0)} aus Koordinaten, "
-          f"{src.get('default', 0)} nicht ermittelbar (es wird {DEFAULT_TZ} angenommen)")
 
     # 2) Optional: inaktive Stationen aussortieren
     to_query, station_rows = [], []
@@ -486,6 +481,6 @@ def main():
     print(f"Dateien in: {out.resolve()}")
     if interrupted:
         sys.exit(130)
-        
+
 if __name__ == "__main__":
     main()
