@@ -3,7 +3,8 @@
 Ruft von BirdWeather-PUC-Stationen Daten für Zeiträume oder Einzeltage ab:
   - Standort (stations.csv)
   - Detections (detections.csv)
-  - Sensordaten inkl. AirPollution (sensor_<typ>.csv)
+  - Sensordaten (sensor_<typ>.csv)
+  - Aktuelle OpenWeather-Quellen-Koordinaten (air_pollution_coords.csv)
 
 Standard: PUC-Stationen in Deutschland. Mit --world: alle PUC-Stationen weltweit.
 Mit --stations ID1 ID2: nur spezifische Stationen abrufen (überspringt Netzwerksuche).
@@ -130,10 +131,21 @@ query($ids: [ID!], $period: InputDuration, $first: Int, $after: String) {
 }
 """
 
+# NEU: Abfrage ohne History-Parameter, ruft nur das aktuelle AirPollution-Objekt ab
+AIR_POLLUTION_COORDS_Q = """
+query($id: ID!) {
+  station(id: $id) {
+    airPollution {
+      timestamp
+      coords { lat lon }
+    }
+  }
+}
+"""
+
 SENSOR_FIELDS = {
     "environment": ["temperature", "humidity", "barometricPressure", "voc",
                     "eco2", "aqi", "soundPressureLevel"],
-    "airPollution": ["aqi", "co", "no", "no2", "o3", "so2", "pm2_5", "pm10", "nh3"],
     "light": ["clear", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "nir"],
     "mag": ["x", "y", "z"],
     "accel": ["x", "y", "z"],
@@ -141,6 +153,8 @@ SENSOR_FIELDS = {
                "sdCapacity", "uploadingCompleted", "uploadingTotal", "wifiRssi"],
     "location": ["lat", "lon", "altitude", "satellites"],
 }
+
+AIR_POLLUTION_COORDS_COLS = ["station_id", "date", "timestamp", "lat", "lon"]
 
 def sensor_query(kind):
     fields = " ".join(["timestamp"] + SENSOR_FIELDS[kind])
@@ -281,6 +295,30 @@ def fetch_sensor(kind, sid, tz, start_date, end_date, period):
             for r in paginate(sensor_query(kind), {"id": sid, "period": period}, conn)
             if in_date_range(r["timestamp"], tz, start_date, end_date)]
 
+# NEU: Angepasste Funktion (keine Datums-Schleife mehr nötig)
+def fetch_air_pollution_coords(sid):
+    """Holt die aktuellen OpenWeather-Koordinaten der Station ab (1 Abfrage pro Station)."""
+    try:
+        data = gql(AIR_POLLUTION_COORDS_Q, {"id": sid})
+        ap = (data.get("station") or {}).get("airPollution")
+        
+        if ap:
+            c = ap.get("coords") or {}
+            return [{
+                "station_id": sid,
+                "date": "current",
+                "timestamp": ap.get("timestamp"),
+                "lat": c.get("lat"),
+                "lon": c.get("lon"),
+            }]
+        else:
+            # NEU: Macht das serverseitige 'null' im Terminal sichtbar
+            print(f"    -> Info: API liefert 'airPollution: null' für Station {sid}. (Keine Daten vorhanden)")
+    except Exception as e:
+        print(f"    [AirPollution-Coords FEHLER]: {e}")
+        
+    return []
+
 def process_station(s, ctx):
     args, start_date, end_date, parts = ctx["args"], ctx["start_date"], ctx["end_date"], ctx["parts"]
     sid, tz = s["id"], station_tz(s)
@@ -289,9 +327,15 @@ def process_station(s, ctx):
     jobs = []
     if not args.no_detections:
         jobs.append(("det", DETECTION_COLS, lambda: fetch_detections(sid, tz, start_date, end_date, period)))
-    for kind in args.sensors:
+    
+    selected_sensors = args.sensors if args.sensors is not None else []
+    for kind in selected_sensors:
         jobs.append((kind, sensor_cols(kind),
                      lambda kind=kind: fetch_sensor(kind, sid, tz, start_date, end_date, period)))
+                     
+    if getattr(args, "check_air_pollution_coords", False):
+        jobs.append(("air_pollution_coords", AIR_POLLUTION_COORDS_COLS,
+                     lambda: fetch_air_pollution_coords(sid)))
 
     todo = [j for j in jobs if not (parts / f"{j[0]}_{sid}.csv").exists()]
     res = {"new": 0, "skipped": len(jobs) - len(todo), "failed": []}
@@ -329,8 +373,10 @@ def main():
     ap.add_argument("--out", default="birdweather_out", help="Ausgabeordner")
     ap.add_argument("--world", action="store_true", help="Alle PUC-Stationen weltweit statt nur Deutschland")
     ap.add_argument("--stations", nargs="+", help="Spezifische Stations-IDs abrufen (z.B. --stations 123 456).")
-    ap.add_argument("--sensors", nargs="+", default=list(SENSOR_FIELDS),
+    ap.add_argument("--sensors", nargs="*", default=list(SENSOR_FIELDS),
                     choices=list(SENSOR_FIELDS), help="Welche Sensortypen abgerufen werden")
+    ap.add_argument("--check-air-pollution-coords", action="store_true",
+                    help="Prüft die Quelle der Air-Pollution-Daten (1 Stichprobe pro Station).")
     ap.add_argument("--no-country-filter", action="store_true",
                     help="Deutschland-Modus: nur Bounding Box verwenden, nicht nach Land filtern")
     ap.add_argument("--only-active", action="store_true",
@@ -403,7 +449,6 @@ def main():
     if not pucs:
         sys.exit("Keine gültigen PUC-Stationen gefunden.")
 
-    # Zeitzonen-Quelle und Fallback ermitteln
     src = Counter()
     for s in pucs:
         if s.get("timezone"):
@@ -468,8 +513,14 @@ def main():
     totals = {}
     if not args.no_detections:
         totals["detections"] = merge_parts(parts, "det", ids, out / "detections.csv", DETECTION_COLS)
-    for kind in args.sensors:
+    
+    selected_sensors = args.sensors if args.sensors is not None else []
+    for kind in selected_sensors:
         totals[kind] = merge_parts(parts, kind, ids, out / f"sensor_{kind}.csv", sensor_cols(kind))
+        
+    if getattr(args, "check_air_pollution_coords", False):
+        totals["air_pollution_coords"] = merge_parts(parts, "air_pollution_coords", ids,
+                                                     out / "air_pollution_coords.csv", AIR_POLLUTION_COORDS_COLS)
 
     print(f"\n{'Zwischenstand' if interrupted else 'Fertig'} nach {(time.time() - t0) / 60:.1f} min.")
     print(f"Teile neu abgerufen: {newly_fetched}, bereits vorhanden: {already_done}")
