@@ -1,0 +1,5 @@
+Die Skripts in diesem Ordner dienen der Abschätzung der Datenverfügbarkeit von PUCs und Air-Now-Stationen. Dazu werden pro 1-3 Tage erstmal nur ein Wert abgefragt.
+Angedacher Zeitraum: Januar 2024 - November 2026.
+Es kann eine geographhisches Matching on PUCs und Air-Now-Stationen vorgenommen werden.
+
+Die Abfragen beziehen sich auf das CONUS-Gebiet, das ich vorläufig zur Betrachtung bestimmt habe.
