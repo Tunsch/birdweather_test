@@ -3,11 +3,8 @@
 Ruft von BirdWeather-PUC-Stationen Daten für Zeiträume oder Einzeltage ab:
   - Standort (stations.csv)
   - Detections (detections.csv)
-  - Sensordaten (sensor_<typ>.csv)
+  - Sensordaten kombiniert pro Request (sensor_<typ>.csv)
   - Aktuelle OpenWeather-Quellen-Koordinaten (air_pollution_coords.csv)
-
-Standard: PUC-Stationen in Deutschland. Mit --world: alle PUC-Stationen weltweit.
-Mit --stations ID1 ID2: nur spezifische Stationen abrufen (überspringt Netzwerksuche).
 """
 import argparse
 import csv
@@ -26,8 +23,7 @@ from zoneinfo import ZoneInfo
 import requests
 
 URL = "https://app.birdweather.com/graphql"
-PAGE_SIZE = 2000
-PAUSE = 0.1  
+PAGE_SIZE = 500
 
 NE = {"lat": 55.1, "lon": 15.1}
 SW = {"lat": 47.2, "lon": 5.8}
@@ -35,55 +31,107 @@ GERMANY_NAMES = {"germany", "deutschland", "de"}
 DEFAULT_TZ = "Europe/Berlin"
 
 _local = threading.local()
+_page_cap_reported = False
+
+
+class AdaptivePacer:
+    """Passt die Wartezeit zwischen Requests automatisch an das Server-Limit an."""
+    def __init__(self, initial=0.5, min_pause=0.15, max_pause=5.0):
+        self.lock = threading.Lock()
+        self.pause = initial
+        self.min_pause = min_pause
+        self.max_pause = max_pause
+
+    def get(self):
+        with self.lock:
+            return self.pause
+
+    def on_success(self):
+        with self.lock:
+            self.pause = max(self.min_pause, self.pause - 0.005)
+
+    def on_rate_limit(self):
+        with self.lock:
+            self.pause = min(self.max_pause, self.pause + 0.25)
+            return self.pause
+
+
+pacer = AdaptivePacer(initial=0.5)
+
 
 def get_session():
     if not hasattr(_local, "session"):
         _local.session = requests.Session()
     return _local.session
 
-def gql(query, variables, retries=8, allow_partial=False):
-    """POST an die API mit dynamischem Backoff bei Rate-Limits (HTTP 429)."""
+
+def check_server_page_cap(conn):
+    """Informiert einmalig, falls der Server PAGE_SIZE stillschweigend begrenzt."""
+    global _page_cap_reported
+    if _page_cap_reported or not conn:
+        return
+    nodes = conn.get("nodes") or []
+    has_next = (conn.get("pageInfo") or {}).get("hasNextPage", False)
+    if has_next and 0 < len(nodes) < PAGE_SIZE:
+        _page_cap_reported = True
+        print(f"    [Info] Server begrenzt Seitengröße auf max. {len(nodes)} Einträge pro Request.")
+
+
+def gql(query, variables, retries=10, allow_partial=False, stop_event=None):
+    """POST an die API mit dynamischem Backoff und adaptiver Tempo-Anpassung."""
     base_pause = 2.0
     for attempt in range(retries):
+        if stop_event and stop_event.is_set():
+            return None
         try:
             r = get_session().post(URL, json={"query": query, "variables": variables}, timeout=90)
-            
+
             if r.status_code == 429:
+                new_pause = pacer.on_rate_limit()
                 retry_after = r.headers.get("Retry-After")
                 if retry_after and retry_after.isdigit():
-                    wait_time = int(retry_after)
+                    wait_time = int(retry_after) + 1
                 else:
                     wait_time = base_pause * (2 ** attempt)
-                
-                print(f"    [Rate-Limit 429] Warte {wait_time}s...")
+
+                print(f"    [Rate-Limit 429] Warte {wait_time}s (neue Request-Pause: {new_pause:.2f}s)...")
                 time.sleep(wait_time)
                 continue
 
             r.raise_for_status()
             body = r.json()
-        except (requests.RequestException, ValueError) as e:
+        except (requests.RequestException, ValueError):
             time.sleep(base_pause * (2 ** attempt))
             continue
 
         if body.get("errors") and not (allow_partial and body.get("data")):
             raise RuntimeError(body["errors"])
+
+        pacer.on_success()
         return body["data"]
-    
+
     raise RuntimeError("API dauerhaft blockiert. Später erneut versuchen.")
 
-def paginate(query, variables, get_connection, allow_partial=False):
+
+def paginate(query, variables, get_connection, allow_partial=False, stop_event=None):
     after = None
     while True:
+        if stop_event and stop_event.is_set():
+            return
         data = gql(query, {**variables, "first": PAGE_SIZE, "after": after},
-                   allow_partial=allow_partial)
+                   allow_partial=allow_partial, stop_event=stop_event)
+        if data is None:
+            return
         conn = get_connection(data)
         if conn is None:
             return
+        check_server_page_cap(conn)
         yield from conn["nodes"] or []
         if not conn["pageInfo"]["hasNextPage"]:
             return
         after = conn["pageInfo"]["endCursor"]
-        time.sleep(PAUSE)
+        time.sleep(pacer.get())
+
 
 STATIONS_Q = """
 query($first: Int, $after: String, $ne: InputLocation, $sw: InputLocation) {
@@ -116,7 +164,7 @@ query($first: Int, $after: String, $ne: InputLocation, $sw: InputLocation) {
   }
 }
 """
-
+#soundscape entfernt, da vermutlich unnötiger Bloat
 DETECTIONS_Q = """
 query($ids: [ID!], $period: InputDuration, $first: Int, $after: String) {
   detections(stationIds: $ids, period: $period, first: $first, after: $after) {
@@ -124,14 +172,12 @@ query($ids: [ID!], $period: InputDuration, $first: Int, $after: String) {
       id timestamp confidence probability score certainty
       coords { lat lon }
       species { id commonName scientificName }
-      soundscape { url startTime endTime duration mode }
     }
     pageInfo { hasNextPage endCursor }
   }
 }
 """
 
-# NEU: Abfrage ohne History-Parameter, ruft nur das aktuelle AirPollution-Objekt ab
 AIR_POLLUTION_COORDS_Q = """
 query($id: ID!) {
   station(id: $id) {
@@ -156,22 +202,31 @@ SENSOR_FIELDS = {
 
 AIR_POLLUTION_COORDS_COLS = ["station_id", "date", "timestamp", "lat", "lon"]
 
-def sensor_query(kind):
-    fields = " ".join(["timestamp"] + SENSOR_FIELDS[kind])
-    return f"""
-query($id: ID!, $period: InputDuration, $first: Int, $after: String) {{
-  station(id: $id) {{
-    sensors {{
-      {kind}History(period: $period, first: $first, after: $after) {{
+
+def combined_sensor_query(kinds):
+    """Erstellt eine einzelne GraphQL-Query für mehrere Sensoren gleichzeitig."""
+    var_defs = ", ".join(["$id: ID!", "$period: InputDuration", "$first: Int"]
+                         + [f"$after_{k}: String" for k in kinds])
+    blocks = []
+    for k in kinds:
+        fields = " ".join(["timestamp"] + SENSOR_FIELDS[k])
+        blocks.append(f"""
+      {k}History(period: $period, first: $first, after: $after_{k}) {{
         nodes {{ {fields} }}
         pageInfo {{ hasNextPage endCursor }}
-      }}
+      }}""")
+    return f"""
+query({var_defs}) {{
+  station(id: $id) {{
+    sensors {{{"".join(blocks)}
     }}
   }}
 }}
 """
 
+
 _tzfinder = None
+
 
 def tz_from_coords(lat, lon):
     global _tzfinder
@@ -185,6 +240,7 @@ def tz_from_coords(lat, lon):
     except Exception:
         return None
 
+
 def station_tz(station):
     for name in (station.get("timezone"), DEFAULT_TZ):
         try:
@@ -194,11 +250,13 @@ def station_tz(station):
             pass
     return ZoneInfo("UTC")
 
+
 def station_period(tz, start_date, end_date):
     start = datetime.combine(start_date, dtime.min, tzinfo=tz).astimezone(timezone.utc)
     end = datetime.combine(end_date + timedelta(days=1), dtime.min, tzinfo=tz).astimezone(timezone.utc)
     return {"from": start.date().isoformat(),
             "to": (end.date() + timedelta(days=1)).isoformat()}
+
 
 def to_local_date(ts, tz):
     if not ts:
@@ -208,11 +266,13 @@ def to_local_date(ts, tz):
         dt = dt.replace(tzinfo=tz)
     return dt.astimezone(tz).date()
 
+
 def in_date_range(ts, tz, start_date, end_date):
     d = to_local_date(ts, tz)
     if d is None:
         return False
     return start_date <= d <= end_date
+
 
 def is_active_in_range(station, tz, start_date, end_date):
     latest = to_local_date(station.get("latestDetectionAt"), tz)
@@ -223,6 +283,7 @@ def is_active_in_range(station, tz, start_date, end_date):
         return False
     return True
 
+
 STATION_COLS = ["id", "name", "type", "country", "state", "location", "timezone",
                 "lat", "lon", "locationPrivacy", "earliestDetectionAt",
                 "latestDetectionAt", "timezone_source", "status"]
@@ -231,14 +292,17 @@ DETECTION_COLS = ["station_id", "id", "timestamp", "confidence", "probability", 
                   "soundscape_url", "soundscape_start", "soundscape_end",
                   "soundscape_duration", "soundscape_mode"]
 
+
 def sensor_cols(kind):
     return ["station_id", "timestamp"] + SENSOR_FIELDS[kind]
+
 
 def flat_station(s, status):
     c = s.get("coords") or {}
     row = {k: s.get(k) for k in STATION_COLS}
     row.update(lat=c.get("lat"), lon=c.get("lon"), status=status)
     return row
+
 
 def flat_detection(d, station_id):
     sp, ss, c = d.get("species") or {}, d.get("soundscape") or {}, d.get("coords") or {}
@@ -255,6 +319,7 @@ def flat_detection(d, station_id):
         "soundscape_mode": ss.get("mode"),
     }
 
+
 def write_csv_atomic(path, columns, rows):
     tmp = path.with_suffix(".tmp")
     with open(tmp, "w", newline="", encoding="utf-8") as f:
@@ -262,6 +327,7 @@ def write_csv_atomic(path, columns, rows):
         w.writeheader()
         w.writerows(rows)
     os.replace(tmp, path)
+
 
 def merge_parts(parts_dir, prefix, station_ids, out_path, columns):
     n = 0
@@ -280,28 +346,64 @@ def merge_parts(parts_dir, prefix, station_ids, out_path, columns):
     os.replace(tmp, out_path)
     return n
 
-def fetch_detections(sid, tz, start_date, end_date, period):
+
+def fetch_detections(sid, tz, start_date, end_date, period, stop_event=None):
     return [flat_detection(d, sid)
             for d in paginate(DETECTIONS_Q, {"ids": [sid], "period": period},
-                              lambda data: data["detections"])
-            if in_date_range(d["timestamp"], tz, start_date, end_date)]
+                              lambda data: data["detections"], stop_event=stop_event)
+            if d and in_date_range(d["timestamp"], tz, start_date, end_date)]
 
-def fetch_sensor(kind, sid, tz, start_date, end_date, period):
-    def conn(data):
-        sensors = (data.get("station") or {}).get("sensors")
-        return sensors.get(f"{kind}History") if sensors else None
 
-    return [{"station_id": sid, **r}
-            for r in paginate(sensor_query(kind), {"id": sid, "period": period}, conn)
-            if in_date_range(r["timestamp"], tz, start_date, end_date)]
+def fetch_sensors_combined(kinds, sid, tz, start_date, end_date, period, stop_event=None):
+    """Fragt mehrere Sensoren gleichzeitig pro Seitenaufruf ab."""
+    cursors = {k: None for k in kinds}
+    active = {k: True for k in kinds}
+    results = {k: [] for k in kinds}
 
-# NEU: Angepasste Funktion (keine Datums-Schleife mehr nötig)
-def fetch_air_pollution_coords(sid):
-    """Holt die aktuellen OpenWeather-Koordinaten der Station ab (1 Abfrage pro Station)."""
+    while any(active.values()):
+        if stop_event and stop_event.is_set():
+            return None
+        active_kinds = [k for k, is_act in active.items() if is_act]
+        query = combined_sensor_query(active_kinds)
+        variables = {
+            "id": sid,
+            "period": period,
+            "first": PAGE_SIZE,
+            **{f"after_{k}": cursors[k] for k in active_kinds},
+        }
+        data = gql(query, variables, stop_event=stop_event)
+        if data is None:
+            return None
+
+        sensors_data = (data.get("station") or {}).get("sensors") or {}
+        for k in active_kinds:
+            conn = sensors_data.get(f"{k}History")
+            if not conn:
+                active[k] = False
+                continue
+            check_server_page_cap(conn)
+            for r in conn.get("nodes") or []:
+                if r and in_date_range(r["timestamp"], tz, start_date, end_date):
+                    results[k].append({"station_id": sid, **r})
+            page_info = conn.get("pageInfo") or {}
+            if page_info.get("hasNextPage"):
+                cursors[k] = page_info.get("endCursor")
+            else:
+                active[k] = False
+
+        if any(active.values()):
+            time.sleep(pacer.get())
+
+    return results
+
+
+def fetch_air_pollution_coords(sid, stop_event=None):
+    """Holt die aktuellen OpenWeather-Koordinaten der Station ab."""
     try:
-        data = gql(AIR_POLLUTION_COORDS_Q, {"id": sid})
+        data = gql(AIR_POLLUTION_COORDS_Q, {"id": sid}, stop_event=stop_event)
+        if data is None:
+            return []
         ap = (data.get("station") or {}).get("airPollution")
-        
         if ap:
             c = ap.get("coords") or {}
             return [{
@@ -311,59 +413,98 @@ def fetch_air_pollution_coords(sid):
                 "lat": c.get("lat"),
                 "lon": c.get("lon"),
             }]
-        else:
-            # NEU: Macht das serverseitige 'null' im Terminal sichtbar
-            print(f"    -> Info: API liefert 'airPollution: null' für Station {sid}. (Keine Daten vorhanden)")
     except Exception as e:
         print(f"    [AirPollution-Coords FEHLER]: {e}")
-        
     return []
+
 
 def process_station(s, ctx):
     args, start_date, end_date, parts = ctx["args"], ctx["start_date"], ctx["end_date"], ctx["parts"]
+    stop_event = ctx["stop"]
     sid, tz = s["id"], station_tz(s)
     period = station_period(tz, start_date, end_date)
 
-    jobs = []
-    if not args.no_detections:
-        jobs.append(("det", DETECTION_COLS, lambda: fetch_detections(sid, tz, start_date, end_date, period)))
-    
     selected_sensors = args.sensors if args.sensors is not None else []
-    for kind in selected_sensors:
-        jobs.append((kind, sensor_cols(kind),
-                     lambda kind=kind: fetch_sensor(kind, sid, tz, start_date, end_date, period)))
-                     
-    if getattr(args, "check_air_pollution_coords", False):
-        jobs.append(("air_pollution_coords", AIR_POLLUTION_COORDS_COLS,
-                     lambda: fetch_air_pollution_coords(sid)))
+    total_parts = (0 if args.no_detections else 1) + len(selected_sensors) + (
+        1 if getattr(args, "check_air_pollution_coords", False) else 0
+    )
 
-    todo = [j for j in jobs if not (parts / f"{j[0]}_{sid}.csv").exists()]
-    res = {"new": 0, "skipped": len(jobs) - len(todo), "failed": []}
+    res = {"new": 0, "skipped": 0, "failed": []}
     lines = []
 
-    for part, cols, fn in todo:
-        if ctx["stop"].is_set():
-            break
+    # 1) Detections
+    if not args.no_detections:
+        det_path = parts / f"det_{sid}.csv"
+        if det_path.exists():
+            res["skipped"] += 1
+        elif not stop_event.is_set():
+            try:
+                rows = fetch_detections(sid, tz, start_date, end_date, period, stop_event=stop_event)
+                if not stop_event.is_set():
+                    write_csv_atomic(det_path, DETECTION_COLS, rows)
+                    res["new"] += 1
+                    if rows:
+                        lines.append(f"    det: {len(rows)}")
+            except Exception as e:
+                lines.append(f"    det FEHLER: {e}")
+                res["failed"].append(f"{sid}:det")
+
+    # 2) Alle noch fehlenden Sensoren kombiniert abrufen
+    todo_sensors = []
+    for kind in selected_sensors:
+        if (parts / f"{kind}_{sid}.csv").exists():
+            res["skipped"] += 1
+        else:
+            todo_sensors.append(kind)
+
+    if todo_sensors and not stop_event.is_set():
         try:
-            rows = fn()
+            sensor_results = fetch_sensors_combined(
+                todo_sensors, sid, tz, start_date, end_date, period, stop_event=stop_event
+            )
+            if sensor_results is not None and not stop_event.is_set():
+                for kind in todo_sensors:
+                    rows = sensor_results[kind]
+                    write_csv_atomic(parts / f"{kind}_{sid}.csv", sensor_cols(kind), rows)
+                    res["new"] += 1
+                    if rows:
+                        lines.append(f"    {kind}: {len(rows)}")
         except Exception as e:
-            lines.append(f"    {part} FEHLER: {e}")
-            res["failed"].append(f"{sid}:{part}")
-            continue
-        write_csv_atomic(parts / f"{part}_{sid}.csv", cols, rows)
-        res["new"] += 1
-        if rows:
-            lines.append(f"    {part}: {len(rows)}")
+            label = "+".join(todo_sensors)
+            lines.append(f"    {label} FEHLER: {e}")
+            for kind in todo_sensors:
+                res["failed"].append(f"{sid}:{kind}")
+
+    # 3) Optional: AirPollution Coords
+    if getattr(args, "check_air_pollution_coords", False):
+        ap_path = parts / f"air_pollution_coords_{sid}.csv"
+        if ap_path.exists():
+            res["skipped"] += 1
+        elif not stop_event.is_set():
+            try:
+                rows = fetch_air_pollution_coords(sid, stop_event=stop_event)
+                if not stop_event.is_set():
+                    write_csv_atomic(ap_path, AIR_POLLUTION_COORDS_COLS, rows)
+                    res["new"] += 1
+                    if rows:
+                        lines.append(f"    air_pollution_coords: {len(rows)}")
+            except Exception as e:
+                lines.append(f"    air_pollution_coords FEHLER: {e}")
+                res["failed"].append(f"{sid}:air_pollution_coords")
 
     with ctx["lock"]:
         ctx["done"] += 1
-        status = "bereits komplett" if not todo else f"{len(todo)}/{len(jobs)} Teile abgerufen"
+        if res["new"] == 0 and not res["failed"] and res["skipped"] == total_parts:
+            status = "bereits komplett"
+        else:
+            status = f"{res['new']}/{total_parts} Teile abgerufen"
         elapsed = (time.time() - ctx["t0"]) / 60
         print(f"[{ctx['done']}/{ctx['total']}] Station {sid} {s.get('name')!r}: {status}"
               f"  ({elapsed:.1f} min)")
         for line in lines:
             print(line)
     return res
+
 
 def main():
     global DEFAULT_TZ
@@ -384,14 +525,14 @@ def main():
     ap.add_argument("--no-detections", action="store_true",
                     help="Keine Detections abrufen (nur Standort und Sensordaten)")
     ap.add_argument("--workers", type=int, default=1,
-                    help="Anzahl paralleler Stationsabrufe (Standard 1; bei --world z. B. 4)")
+                    help="Anzahl paralleler Stationsabrufe (Standard 1)")
     ap.add_argument("--fresh", action="store_true",
                     help="Vorhandene Teildateien dieses Zeitraums löschen und komplett neu abrufen")
     args = ap.parse_args()
 
     if args.world or args.stations:
         DEFAULT_TZ = "UTC"
-        
+
     start_date = date.fromisoformat(args.start_date)
     end_date = date.fromisoformat(args.end_date) if args.end_date else start_date
 
@@ -401,7 +542,7 @@ def main():
     folder_name = start_date.isoformat() if start_date == end_date else f"{start_date.isoformat()}_{end_date.isoformat()}"
     out = Path(args.out) / folder_name
     parts = out / "parts"
-    
+
     if args.fresh and parts.exists():
         shutil.rmtree(parts)
     parts.mkdir(parents=True, exist_ok=True)
@@ -431,7 +572,7 @@ def main():
         countries = Counter(s.get("country") for s in pucs)
         print("  Länder der PUCs:", dict(countries.most_common(15)),
               "..." if len(countries) > 15 else "")
-        
+
         if not args.world and not args.no_country_filter:
             pucs = [s for s in pucs if (s.get("country") or "").lower() in GERMANY_NAMES]
 
@@ -449,7 +590,6 @@ def main():
     if not pucs:
         sys.exit("Keine gültigen PUC-Stationen gefunden.")
 
-    src = Counter()
     for s in pucs:
         if s.get("timezone"):
             s["timezone_source"] = "api"
@@ -460,8 +600,7 @@ def main():
                 s["timezone"], s["timezone_source"] = name, "coords"
             else:
                 s["timezone"], s["timezone_source"] = None, "default"
-        src[s["timezone_source"]] += 1
-    
+
     print(f"  {len(pucs)} Station(en) bereit zur Abfrage.")
 
     # 2) Optional: inaktive Stationen aussortieren
@@ -479,8 +618,9 @@ def main():
     write_csv_atomic(out / "stations.csv", STATION_COLS, station_rows)
 
     # 3) Pro Station: Detections + Sensordaten
-    ctx = {"args": args, "start_date": start_date, "end_date": end_date, "parts": parts, "stop": threading.Event(),
-           "lock": threading.Lock(), "done": 0, "total": len(to_query), "t0": time.time()}
+    ctx = {"args": args, "start_date": start_date, "end_date": end_date, "parts": parts,
+           "stop": threading.Event(), "lock": threading.Lock(),
+           "done": 0, "total": len(to_query), "t0": time.time()}
     interrupted = False
     t0 = time.time()
 
@@ -493,7 +633,7 @@ def main():
     except KeyboardInterrupt:
         interrupted = True
         ctx["stop"].set()
-        print("\nAbbruch: warte auf laufende Abrufe, bereits gespeicherte Teile bleiben erhalten ...")
+        print("\nAbbruch: warte auf laufenden Request, bereits gespeicherte Teile bleiben erhalten ...")
         ex.shutdown(wait=True, cancel_futures=True)
 
     failed, newly_fetched, already_done = [], 0, 0
@@ -513,14 +653,15 @@ def main():
     totals = {}
     if not args.no_detections:
         totals["detections"] = merge_parts(parts, "det", ids, out / "detections.csv", DETECTION_COLS)
-    
+
     selected_sensors = args.sensors if args.sensors is not None else []
     for kind in selected_sensors:
         totals[kind] = merge_parts(parts, kind, ids, out / f"sensor_{kind}.csv", sensor_cols(kind))
-        
+
     if getattr(args, "check_air_pollution_coords", False):
-        totals["air_pollution_coords"] = merge_parts(parts, "air_pollution_coords", ids,
-                                                     out / "air_pollution_coords.csv", AIR_POLLUTION_COORDS_COLS)
+        totals["air_pollution_coords"] = merge_parts(
+            parts, "air_pollution_coords", ids, out / "air_pollution_coords.csv", AIR_POLLUTION_COORDS_COLS
+        )
 
     print(f"\n{'Zwischenstand' if interrupted else 'Fertig'} nach {(time.time() - t0) / 60:.1f} min.")
     print(f"Teile neu abgerufen: {newly_fetched}, bereits vorhanden: {already_done}")
@@ -532,6 +673,7 @@ def main():
     print(f"Dateien in: {out.resolve()}")
     if interrupted:
         sys.exit(130)
+
 
 if __name__ == "__main__":
     main()
